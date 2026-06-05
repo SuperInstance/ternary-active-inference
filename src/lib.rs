@@ -1,390 +1,412 @@
-//! Active Inference over ternary (−1, 0, +1) action and observation spaces.
-//!
-//! Implements the free-energy minimisation framework where agents select actions
-//! by minimising Expected Free Energy (EFE) across a three-valued signal space.
+//! Active Inference over ternary action spaces {-1, 0, +1}.
 
-/// Map ternary value {-1, 0, +1} to array index {0, 1, 2}.
-fn obs_to_idx(v: i8) -> usize {
-    match v {
-        -1 => 0,
-        1  => 2,
-        _  => 1,
+pub type TernaryVal = i8;
+pub const TERNARY_VALS: [TernaryVal; 3] = [-1, 0, 1];
+
+fn ternary_idx(v: TernaryVal) -> usize {
+    (v + 1) as usize
+}
+
+fn normalize(v: &mut Vec<f64>) {
+    let sum: f64 = v.iter().sum();
+    if sum > 1e-12 {
+        for x in v.iter_mut() {
+            *x /= sum;
+        }
     }
 }
 
-/// Map array index {0, 1, 2} to ternary value {-1, 0, +1}.
-fn idx_to_ternary(i: usize) -> i8 {
-    match i {
-        0 => -1,
-        2 => 1,
-        _ => 0,
-    }
+fn softmax(v: &[f64], beta: f64) -> Vec<f64> {
+    let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exp: Vec<f64> = v.iter().map(|&x| (beta * x - beta * max).exp()).collect();
+    let sum: f64 = exp.iter().sum();
+    exp.iter().map(|&e| e / sum).collect()
 }
 
-fn vec_normalize(v: &mut Vec<f64>) {
-    let s: f64 = v.iter().sum();
-    if s > 1e-12 {
-        for x in v.iter_mut() { *x /= s; }
-    } else {
-        let n = v.len() as f64;
-        for x in v.iter_mut() { *x = 1.0 / n; }
-    }
-}
-
-fn vec_entropy(dist: &[f64]) -> f64 {
-    dist.iter()
-        .filter(|&&p| p > 1e-12)
-        .map(|&p| -p * p.ln())
-        .sum()
-}
-
-// ─── GenerativeModel ────────────────────────────────────────────────────────
-
-/// Encodes beliefs about how states generate observations and how actions drive transitions.
-///
-/// - `prior`: distribution over n_states
-/// - `likelihood`: n_states rows, each `[p(obs=-1|s), p(obs=0|s), p(obs=+1|s)]`
-/// - `transitions`: 3 matrices (one per ternary action), each n_states × n_states
+/// Encodes P(o|s), P(s'|s,a), P(s).
 pub struct GenerativeModel {
+    pub n_states: usize,
+    pub n_obs_dims: usize,
+    /// likelihood[s][obs_dim] = [P(o=-1|s), P(o=0|s), P(o=+1|s)]
+    pub likelihood: Vec<Vec<[f64; 3]>>,
+    /// transition[action_idx][from_state] = distribution over next states
+    pub transition: Vec<Vec<Vec<f64>>>,
+    /// prior P(s)
     pub prior: Vec<f64>,
-    pub likelihood: Vec<[f64; 3]>,
-    pub transitions: Vec<Vec<Vec<f64>>>,
+    /// always 3 for ternary
+    pub n_actions: usize,
 }
 
 impl GenerativeModel {
-    /// Uniform initialisation over `n_states`.
-    pub fn new(n_states: usize) -> Self {
-        let n = n_states.max(1);
-        let p = 1.0 / n as f64;
-        let uniform_row = vec![p; n];
-        let mat = vec![uniform_row; n];
+    pub fn new(
+        n_states: usize,
+        n_obs_dims: usize,
+        likelihood: Vec<Vec<[f64; 3]>>,
+        transition: Vec<Vec<Vec<f64>>>,
+        prior: Vec<f64>,
+    ) -> Self {
+        assert_eq!(likelihood.len(), n_states);
+        assert_eq!(transition.len(), 3, "need 3 ternary actions");
+        assert_eq!(prior.len(), n_states);
         Self {
-            prior: vec![p; n],
-            likelihood: vec![[1.0 / 3.0; 3]; n],
-            transitions: vec![mat.clone(), mat.clone(), mat],
+            n_states,
+            n_obs_dims,
+            likelihood,
+            transition,
+            prior,
+            n_actions: 3,
         }
     }
 
-    /// Predicted observation distribution: marginalise likelihood over prior.
-    pub fn predict_observation(&self) -> [f64; 3] {
-        let mut pred = [0.0f64; 3];
-        for (s, &ps) in self.prior.iter().enumerate() {
-            if s < self.likelihood.len() {
-                for o in 0..3 {
-                    pred[o] += ps * self.likelihood[s][o];
-                }
-            }
-        }
-        let s: f64 = pred.iter().sum();
-        if s > 1e-12 { for p in &mut pred { *p /= s; } }
-        pred
-    }
-
-    /// Return a new model whose prior is the result of taking `action`.
-    pub fn transition(&self, action: i8) -> GenerativeModel {
-        let aidx = obs_to_idx(action);
-        let n = self.prior.len();
-        let mut new_prior = vec![0.0f64; n];
-        let mat = &self.transitions[aidx];
-        for (from, &ps) in self.prior.iter().enumerate() {
-            if from < mat.len() {
-                for (to, &t) in mat[from].iter().enumerate() {
-                    if to < n { new_prior[to] += ps * t; }
-                }
-            }
-        }
-        vec_normalize(&mut new_prior);
-        GenerativeModel {
-            prior: new_prior,
-            likelihood: self.likelihood.clone(),
-            transitions: self.transitions.clone(),
-        }
+    pub fn uniform(n_states: usize, n_obs_dims: usize) -> Self {
+        let likelihood = vec![vec![[1.0 / 3.0; 3]; n_obs_dims]; n_states];
+        let trans_row = vec![1.0 / n_states as f64; n_states];
+        let transition = vec![vec![trans_row.clone(); n_states]; 3];
+        let prior = vec![1.0 / n_states as f64; n_states];
+        Self::new(n_states, n_obs_dims, likelihood, transition, prior)
     }
 }
 
-// ─── VariationalBayes ───────────────────────────────────────────────────────
-
-/// Posterior update via Bayes rule: q(s) ∝ p(obs | s) × prior(s).
+/// Updates posterior Q(s) given observations via Bayesian inference.
 pub struct VariationalBayes;
 
 impl VariationalBayes {
-    /// Return the per-state likelihood column for a given observation.
-    pub fn likelihood_col(model: &GenerativeModel, obs: i8) -> Vec<f64> {
-        let oidx = obs_to_idx(obs);
-        model.likelihood.iter().map(|row| row[oidx]).collect()
+    pub fn update_posterior(
+        &self,
+        model: &GenerativeModel,
+        prior: &[f64],
+        obs: &[TernaryVal],
+    ) -> Vec<f64> {
+        let mut posterior = prior.to_vec();
+        for (dim, &o) in obs.iter().enumerate() {
+            let oi = ternary_idx(o);
+            for s in 0..model.n_states {
+                posterior[s] *= model.likelihood[s][dim][oi];
+            }
+        }
+        normalize(&mut posterior);
+        posterior
     }
 
-    /// Bayesian update: posterior ∝ likelihood_col × prior.
-    pub fn update(prior: &[f64], likelihood_col: &[f64]) -> Vec<f64> {
-        let mut posterior: Vec<f64> = prior.iter()
-            .zip(likelihood_col.iter())
-            .map(|(&p, &l)| p * l)
-            .collect();
-        vec_normalize(&mut posterior);
-        posterior
+    /// KL divergence KL[Q||P] for distributions over states.
+    pub fn kl_divergence(q: &[f64], p: &[f64]) -> f64 {
+        q.iter()
+            .zip(p.iter())
+            .filter(|(&qi, &pi)| qi > 1e-12 && pi > 1e-12)
+            .map(|(&qi, &pi)| qi * (qi / pi).ln())
+            .sum()
     }
 }
 
-// ─── ExpectedFreeEnergy ─────────────────────────────────────────────────────
-
-/// EFE(a) = ambiguity + risk.
-///
-/// ambiguity = H\[p(o|a)\] — entropy of predicted observations after action a
-/// risk      = KL(p(o|a) ‖ C) — divergence from preferred observations C
+/// Computes Expected Free Energy G(a) for each ternary action.
 pub struct ExpectedFreeEnergy;
 
 impl ExpectedFreeEnergy {
-    pub fn compute(model: &GenerativeModel, action: i8, preferences: &[f64]) -> f64 {
-        let future = model.transition(action);
-        let pred = future.predict_observation();
-
-        let ambiguity = vec_entropy(&pred);
-
-        // Normalise preferences to a distribution over {-1,0,+1}
-        let psum: f64 = preferences.iter().take(3).sum();
-        let mut risk = 0.0f64;
-        for i in 0..3_usize.min(preferences.len()) {
-            let po = pred[i];
-            let c = if psum > 1e-12 { preferences[i] / psum } else { 1.0 / 3.0 };
-            if po > 1e-12 && c > 1e-12 {
-                risk += po * (po / c).ln();
+    /// G(a) = epistemic_value + pragmatic_cost
+    /// epistemic: entropy of predicted next-state distribution
+    /// pragmatic: KL[Q(s_next|a) || P(s)]
+    pub fn compute(
+        &self,
+        model: &GenerativeModel,
+        posterior: &[f64],
+        action_idx: usize,
+    ) -> f64 {
+        let trans = &model.transition[action_idx];
+        // Predicted next state: sum_s Q(s) * P(s'|s,a)
+        let mut predicted = vec![0.0f64; model.n_states];
+        for s in 0..model.n_states {
+            for s_next in 0..model.n_states {
+                predicted[s_next] += posterior[s] * trans[s][s_next];
             }
         }
-        ambiguity + risk
+
+        // Epistemic value: entropy H(predicted)
+        let entropy: f64 = predicted
+            .iter()
+            .filter(|&&p| p > 1e-12)
+            .map(|&p| -p * p.ln())
+            .sum();
+
+        // Pragmatic cost: KL[predicted || prior]
+        let kl = VariationalBayes::kl_divergence(&predicted, &model.prior);
+
+        // G = -epistemic + pragmatic (higher entropy reduces G, KL increases G)
+        -entropy + kl
+    }
+
+    pub fn all_actions(&self, model: &GenerativeModel, posterior: &[f64]) -> Vec<f64> {
+        (0..model.n_actions)
+            .map(|a| self.compute(model, posterior, a))
+            .collect()
     }
 }
 
-// ─── PolicySelection ────────────────────────────────────────────────────────
-
-/// Select the ternary action {-1, 0, +1} that minimises EFE.
-pub struct PolicySelection;
+/// Selects policy (action) via softmax over -G(a).
+pub struct PolicySelection {
+    pub precision: f64,
+}
 
 impl PolicySelection {
-    pub fn select(model: &GenerativeModel, preferences: &[f64]) -> i8 {
-        let mut best_action = 0i8;
-        let mut best_efe = f64::INFINITY;
-        for &a in &[-1i8, 0, 1] {
-            let efe = ExpectedFreeEnergy::compute(model, a, preferences);
-            if efe < best_efe {
-                best_efe = efe;
-                best_action = a;
-            }
-        }
-        best_action
+    pub fn new(precision: f64) -> Self {
+        Self { precision }
+    }
+
+    pub fn action_distribution(&self, efe: &[f64]) -> Vec<f64> {
+        // softmax(-precision * G)
+        softmax(&efe.iter().map(|&g| -g).collect::<Vec<_>>(), self.precision)
+    }
+
+    pub fn select_action(&self, efe: &[f64]) -> usize {
+        let probs = self.action_distribution(efe);
+        probs
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    pub fn select_ternary(&self, efe: &[f64]) -> TernaryVal {
+        TERNARY_VALS[self.select_action(efe)]
     }
 }
 
-// ─── PerceptionActionLoop ───────────────────────────────────────────────────
+/// Scales EFE by a precision (inverse-temperature) parameter γ.
+pub struct PrecisionWeighting {
+    pub gamma: f64,
+}
 
-/// Closed-loop cycle: observe → infer → act → update.
+impl PrecisionWeighting {
+    pub fn new(gamma: f64) -> Self {
+        Self { gamma }
+    }
+
+    pub fn weighted_efe(&self, efe: &[f64]) -> Vec<f64> {
+        efe.iter().map(|&g| self.gamma * g).collect()
+    }
+
+    /// Update γ = 1 / E_π[|G(π)|] based on expected free energy under current policy.
+    pub fn update_precision(&mut self, efe: &[f64], action_probs: &[f64]) {
+        let expected_g: f64 = efe
+            .iter()
+            .zip(action_probs.iter())
+            .map(|(&g, &p)| g.abs() * p)
+            .sum();
+        if expected_g > 1e-10 {
+            self.gamma = 1.0 / expected_g;
+        }
+    }
+}
+
+/// Iterates perception (VB update) and action (policy selection).
 pub struct PerceptionActionLoop {
     pub model: GenerativeModel,
-    pub preferences: Vec<f64>,
+    pub vb: VariationalBayes,
+    pub efe: ExpectedFreeEnergy,
+    pub policy: PolicySelection,
+    pub precision: PrecisionWeighting,
     pub beliefs: Vec<f64>,
 }
 
 impl PerceptionActionLoop {
-    pub fn new(model: GenerativeModel, preferences: Vec<f64>) -> Self {
+    pub fn new(model: GenerativeModel, precision_gamma: f64) -> Self {
+        let n_states = model.n_states;
         let beliefs = model.prior.clone();
-        Self { model, preferences, beliefs }
-    }
-
-    /// Run one cycle given `observation`. Returns the chosen action.
-    pub fn step(&mut self, observation: i8) -> i8 {
-        // Infer
-        let lik = VariationalBayes::likelihood_col(&self.model, observation);
-        self.beliefs = VariationalBayes::update(&self.beliefs, &lik);
-        self.model.prior = self.beliefs.clone();
-
-        // Act
-        let action = PolicySelection::select(&self.model, &self.preferences);
-
-        // Update
-        self.model = self.model.transition(action);
-        self.beliefs = self.model.prior.clone();
-
-        action
-    }
-}
-
-// ─── PrecisionWeighting ─────────────────────────────────────────────────────
-
-/// Attention-like precision scaling over ternary modalities.
-///
-/// Higher precision → beliefs from that modality weighted more heavily.
-/// Precision decays toward zero as prediction error grows.
-pub struct PrecisionWeighting {
-    pub weights: Vec<f64>,
-}
-
-impl PrecisionWeighting {
-    pub fn new(n_modalities: usize) -> Self {
-        Self { weights: vec![1.0; n_modalities] }
-    }
-
-    /// Scale beliefs by precision weights and renormalise.
-    pub fn weight_beliefs(&self, beliefs: &[f64]) -> Vec<f64> {
-        let n = beliefs.len().min(self.weights.len());
-        let mut out: Vec<f64> = (0..n).map(|i| beliefs[i] * self.weights[i]).collect();
-        vec_normalize(&mut out);
-        out
-    }
-
-    /// Exponential moving-average update: large error → precision shrinks.
-    pub fn update_precision(&mut self, prediction_error: f64, modality: usize) {
-        if modality < self.weights.len() {
-            let new_val = 1.0 / (1.0 + prediction_error.abs());
-            self.weights[modality] = 0.9 * self.weights[modality] + 0.1 * new_val;
+        Self {
+            model,
+            vb: VariationalBayes,
+            efe: ExpectedFreeEnergy,
+            policy: PolicySelection::new(precision_gamma),
+            precision: PrecisionWeighting::new(precision_gamma),
+            beliefs: if beliefs.is_empty() {
+                vec![1.0 / n_states as f64; n_states]
+            } else {
+                beliefs
+            },
         }
     }
-}
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+    pub fn perceive(&mut self, obs: &[TernaryVal]) {
+        self.beliefs = self.vb.update_posterior(&self.model, &self.beliefs, obs);
+    }
+
+    pub fn act(&mut self) -> TernaryVal {
+        let efe_vals = self.efe.all_actions(&self.model, &self.beliefs);
+        let weighted = self.precision.weighted_efe(&efe_vals);
+        let action_probs = self.policy.action_distribution(&weighted);
+        self.precision.update_precision(&efe_vals, &action_probs);
+        self.policy.select_ternary(&weighted)
+    }
+
+    pub fn step(&mut self, obs: &[TernaryVal]) -> TernaryVal {
+        self.perceive(obs);
+        self.act()
+    }
+
+    pub fn belief_entropy(&self) -> f64 {
+        self.beliefs
+            .iter()
+            .filter(|&&p| p > 1e-12)
+            .map(|&p| -p * p.ln())
+            .sum()
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn close(a: f64, b: f64) -> bool { (a - b).abs() < 1e-6 }
-    fn sums_to_one(v: &[f64]) -> bool { close(v.iter().sum::<f64>(), 1.0) }
-
-    #[test]
-    fn test_generative_model_uniform_prior() {
-        let m = GenerativeModel::new(4);
-        assert_eq!(m.prior.len(), 4);
-        assert!(sums_to_one(&m.prior));
-        assert!(close(m.prior[0], 0.25));
+    fn simple_model() -> GenerativeModel {
+        let n_states = 3;
+        let n_obs_dims = 1;
+        // Each state prefers the corresponding ternary observation
+        let likelihood = vec![
+            vec![[0.8, 0.1, 0.1]],
+            vec![[0.1, 0.8, 0.1]],
+            vec![[0.1, 0.1, 0.8]],
+        ];
+        // Action 0 (=-1): tends toward state 0; action 1 (=0): stays; action 2 (=+1): state 2
+        let t0 = vec![
+            vec![0.7, 0.2, 0.1],
+            vec![0.5, 0.3, 0.2],
+            vec![0.3, 0.4, 0.3],
+        ];
+        let t1 = vec![
+            vec![0.33, 0.34, 0.33],
+            vec![0.33, 0.34, 0.33],
+            vec![0.33, 0.34, 0.33],
+        ];
+        let t2 = vec![
+            vec![0.1, 0.2, 0.7],
+            vec![0.2, 0.3, 0.5],
+            vec![0.1, 0.2, 0.7],
+        ];
+        let prior = vec![1.0 / 3.0; 3];
+        GenerativeModel::new(n_states, n_obs_dims, likelihood, vec![t0, t1, t2], prior)
     }
 
     #[test]
-    fn test_generative_model_single_state() {
-        let m = GenerativeModel::new(1);
-        assert!(sums_to_one(&m.prior));
-        let pred = m.predict_observation();
-        assert!(close(pred.iter().sum::<f64>(), 1.0));
+    fn test_generative_model_construction() {
+        let m = simple_model();
+        assert_eq!(m.n_states, 3);
+        assert_eq!(m.n_actions, 3);
     }
 
     #[test]
-    fn test_predict_observation_uniform_likelihood() {
-        let m = GenerativeModel::new(3);
-        let pred = m.predict_observation();
-        assert!(close(pred[0], 1.0 / 3.0));
-        assert!(close(pred[1], 1.0 / 3.0));
-        assert!(close(pred[2], 1.0 / 3.0));
+    fn test_vb_posterior_normalizes() {
+        let m = simple_model();
+        let vb = VariationalBayes;
+        let prior = vec![1.0 / 3.0; 3];
+        let obs = vec![0i8]; // zero observation
+        let post = vb.update_posterior(&m, &prior, &obs);
+        let sum: f64 = post.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-10);
     }
 
     #[test]
-    fn test_generative_model_transition_preserves_normalisation() {
-        let m = GenerativeModel::new(3);
-        let m2 = m.transition(-1);
-        assert!(sums_to_one(&m2.prior));
-        let m3 = m2.transition(1);
-        assert!(sums_to_one(&m3.prior));
-        let m4 = m3.transition(0);
-        assert!(sums_to_one(&m4.prior));
-    }
-
-    #[test]
-    fn test_variational_bayes_update_basic() {
-        let prior = vec![0.5, 0.5];
-        let lik = vec![0.9, 0.1];
-        let post = VariationalBayes::update(&prior, &lik);
-        assert!(sums_to_one(&post));
+    fn test_vb_posterior_updates_correctly() {
+        let m = simple_model();
+        let vb = VariationalBayes;
+        let prior = vec![1.0 / 3.0; 3];
+        // Observe -1 → state 0 should have highest posterior
+        let post = vb.update_posterior(&m, &prior, &[-1i8]);
         assert!(post[0] > post[1]);
+        assert!(post[0] > post[2]);
     }
 
     #[test]
-    fn test_variational_bayes_update_zero_likelihood() {
-        let prior = vec![0.5, 0.5];
-        let lik = vec![0.0, 0.0];
-        let post = VariationalBayes::update(&prior, &lik);
-        assert!(sums_to_one(&post));
-        assert!(!post[0].is_nan());
+    fn test_kl_divergence_identical() {
+        let p = vec![0.3, 0.4, 0.3];
+        let kl = VariationalBayes::kl_divergence(&p, &p);
+        assert!(kl.abs() < 1e-10);
     }
 
     #[test]
-    fn test_variational_bayes_likelihood_col() {
-        let mut m = GenerativeModel::new(2);
-        m.likelihood[0] = [0.8, 0.1, 0.1];
-        m.likelihood[1] = [0.2, 0.7, 0.1];
-        let col = VariationalBayes::likelihood_col(&m, -1);
-        assert!(close(col[0], 0.8));
-        assert!(close(col[1], 0.2));
+    fn test_kl_divergence_nonneg() {
+        let q = vec![0.5, 0.3, 0.2];
+        let p = vec![0.2, 0.5, 0.3];
+        let kl = VariationalBayes::kl_divergence(&q, &p);
+        assert!(kl >= 0.0);
     }
 
     #[test]
-    fn test_expected_free_energy_finite_for_all_actions() {
-        let m = GenerativeModel::new(2);
-        let prefs = vec![0.7, 0.2, 0.1];
-        for &a in &[-1i8, 0, 1] {
-            let efe = ExpectedFreeEnergy::compute(&m, a, &prefs);
-            assert!(efe.is_finite(), "EFE not finite for action {}", a);
-            assert!(efe >= 0.0);
-        }
+    fn test_efe_returns_scalar() {
+        let m = simple_model();
+        let efe_calc = ExpectedFreeEnergy;
+        let posterior = vec![1.0 / 3.0; 3];
+        let g = efe_calc.compute(&m, &posterior, 0);
+        assert!(g.is_finite());
     }
 
     #[test]
-    fn test_expected_free_energy_uniform_prefs_equals_ambiguity() {
-        // With uniform preferences risk → 0, EFE ≈ entropy of predicted obs
-        let m = GenerativeModel::new(3);
-        let prefs = vec![1.0 / 3.0; 3];
-        let efe = ExpectedFreeEnergy::compute(&m, 0, &prefs);
-        let expected_ambiguity = (3.0f64).ln(); // uniform obs dist → max entropy
-        assert!(close(efe, expected_ambiguity));
+    fn test_efe_all_actions_length() {
+        let m = simple_model();
+        let efe_calc = ExpectedFreeEnergy;
+        let posterior = vec![1.0 / 3.0; 3];
+        let gs = efe_calc.all_actions(&m, &posterior);
+        assert_eq!(gs.len(), 3);
     }
 
     #[test]
-    fn test_policy_selection_returns_valid_action() {
-        let m = GenerativeModel::new(3);
-        let prefs = vec![0.6, 0.3, 0.1];
-        let a = PolicySelection::select(&m, &prefs);
+    fn test_policy_distribution_sums_to_one() {
+        let pol = PolicySelection::new(1.0);
+        let efe = vec![0.5, 0.2, 0.8];
+        let dist = pol.action_distribution(&efe);
+        let sum: f64 = dist.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_policy_selects_lowest_efe() {
+        let pol = PolicySelection::new(10.0); // high precision → greedy
+        let efe = vec![1.0, 0.1, 0.5]; // action 1 has lowest EFE
+        assert_eq!(pol.select_action(&efe), 1);
+    }
+
+    #[test]
+    fn test_policy_select_ternary_in_range() {
+        let pol = PolicySelection::new(1.0);
+        let efe = vec![0.5, 0.2, 0.8];
+        let a = pol.select_ternary(&efe);
         assert!(a == -1 || a == 0 || a == 1);
     }
 
     #[test]
-    fn test_perception_action_loop_valid_actions_over_time() {
-        let m = GenerativeModel::new(2);
-        let prefs = vec![0.5, 0.3, 0.2];
-        let mut pal = PerceptionActionLoop::new(m, prefs);
-        for obs in [-1i8, 0, 1, -1, 0, 1] {
-            let a = pal.step(obs);
-            assert!(a == -1 || a == 0 || a == 1, "invalid action {}", a);
+    fn test_precision_weighting_scales() {
+        let pw = PrecisionWeighting::new(2.0);
+        let efe = vec![1.0, 2.0, 3.0];
+        let w = pw.weighted_efe(&efe);
+        assert!((w[0] - 2.0).abs() < 1e-10);
+        assert!((w[1] - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_precision_update() {
+        let mut pw = PrecisionWeighting::new(1.0);
+        let efe = vec![1.0, 2.0, 3.0];
+        let probs = vec![0.5, 0.3, 0.2];
+        pw.update_precision(&efe, &probs);
+        assert!(pw.gamma.is_finite() && pw.gamma > 0.0);
+    }
+
+    #[test]
+    fn test_perception_action_loop_returns_ternary() {
+        let m = simple_model();
+        let mut pal = PerceptionActionLoop::new(m, 1.0);
+        let action = pal.step(&[-1i8]);
+        assert!(action == -1 || action == 0 || action == 1);
+    }
+
+    #[test]
+    fn test_belief_entropy_decreases_with_strong_evidence() {
+        let m = simple_model();
+        let mut pal = PerceptionActionLoop::new(m, 1.0);
+        let h0 = pal.belief_entropy();
+        // Repeatedly observe state-0 signal
+        for _ in 0..5 {
+            pal.perceive(&[-1i8]);
         }
-    }
-
-    #[test]
-    fn test_perception_action_loop_beliefs_stay_normalised() {
-        let m = GenerativeModel::new(3);
-        let prefs = vec![1.0 / 3.0; 3];
-        let mut pal = PerceptionActionLoop::new(m, prefs);
-        for obs in [-1i8, 1, 0, -1, 1, 0] {
-            pal.step(obs);
-            assert!(sums_to_one(&pal.beliefs), "beliefs not normalised");
-        }
-    }
-
-    #[test]
-    fn test_precision_weighting_scales_beliefs() {
-        let mut pw = PrecisionWeighting::new(3);
-        pw.weights = vec![2.0, 1.0, 0.5];
-        let beliefs = vec![0.33, 0.33, 0.34];
-        let w = pw.weight_beliefs(&beliefs);
-        assert!(sums_to_one(&w));
-        assert!(w[0] > w[2]);
-    }
-
-    #[test]
-    fn test_precision_update_shrinks_on_large_error() {
-        let mut pw = PrecisionWeighting::new(2);
-        let initial = pw.weights[0];
-        pw.update_precision(100.0, 0);
-        assert!(pw.weights[0] < initial);
-    }
-
-    #[test]
-    fn test_precision_weighting_empty_beliefs() {
-        let pw = PrecisionWeighting::new(3);
-        let w = pw.weight_beliefs(&[]);
-        assert_eq!(w.len(), 0);
+        let h1 = pal.belief_entropy();
+        assert!(h1 < h0 + 1e-6); // entropy should decrease or stay
     }
 }
