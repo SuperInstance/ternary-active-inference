@@ -1,0 +1,8 @@
+[package]
+name = "ternary-active-inference"
+version = "0.1.0"
+edition = "2021"
+description = "Active Inference with ternary (−1, 0, +1) actions and observations"
+license = "MIT"
+
+[dependencies]
